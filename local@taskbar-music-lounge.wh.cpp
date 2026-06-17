@@ -2,7 +2,7 @@
 // @id              taskbar-music-lounge
 // @name            Taskbar Music Lounge
 // @description     A native-style music ticker with media controls.
-// @version         4.2.5
+// @version         4.3.0
 // @author          Hashah2311 & Chaython
 // @github          https://github.com/Chaython
 // @include         explorer.exe
@@ -15,13 +15,12 @@
 
 A media controller that uses Windows 11 native DWM styling for a seamless look.
 
-### 🛠️ Fork Changelog (v4.2.5)
-* **Fixed:** Instant widget appearance when taskbar auto-hide reveals (bypasses debounce).
-* **Fixed:** App opening fallback now uses case‑insensitive substring matching (fixes Edge, Spotify, etc.).
-* **Fixed:** Progress bar now spans the full width of the panel.
-* **Fixed:** Duration now uses MaxSeekTime as fallback.
-* **Fixed:** Startup flashing when the taskbar is auto-hidden.
-* **Fixed:** Added 500 ms debounce only for startup / taskbar size changes.
+### 🛠️ Fork Changelog (v4.3.0)
+* **New:** Adaptive album‑art colouring – panel tint & progress bar auto‑match the cover art.
+* **New:** Removed white border – window now seamlessly blends with the taskbar.
+* **Fixed:** Instant widget appearance when taskbar auto‑hide reveals (bypasses debounce).
+* **Fixed:** App opening fallback uses case‑insensitive substring matching.
+* **Fixed:** Progress bar spans full width, duration fallback, startup flashing.
 * *Modifications by Chaython.*
 
 ## 🚀 v3 vs v4: Major Architecture Shift
@@ -43,6 +42,7 @@ A media controller that uses Windows 11 native DWM styling for a seamless look.
 * **Volume:** Scroll over widget to adjust volume.
 * **Progress Bar:** Shows playback position when available.
 * **Open App:** Click on the empty area to bring the playing app to the front.
+* **Adaptive Color:** Option to automatically tint the panel based on the album art.
 
 ## ⚠️ Requirements
 * **Disable Widgets:** Taskbar Settings -> Widgets -> Off.
@@ -74,6 +74,8 @@ A media controller that uses Windows 11 native DWM styling for a seamless look.
   $name: Manual Text Color (Hex)
 - BgOpacity: 0
   $name: Acrylic Tint Opacity (0-255). Keep 0 for pure glass.
+- AdaptiveColor: false
+  $name: Adaptive Color (album art tint)
 */
 // ==/WindhawkModSettings==
 
@@ -180,7 +182,8 @@ struct ModSettings {
     int offsetY = 0;
     bool autoTheme = true;
     DWORD manualTextColor = 0xFFFFFFFF; 
-    int bgOpacity = 0;   
+    int bgOpacity = 0;
+    bool adaptiveColor = false;   // new
 } g_Settings;
 
 // --- Global State ---
@@ -205,6 +208,9 @@ struct MediaState {
     INT64 durationTicks = 0;
     mutex lock;
 } g_MediaState;
+
+// Dominant colour for adaptive mode
+DWORD g_DominantColor = 0xFF000000;   // ARGB
 
 // Animation
 int g_ScrollOffset = 0;
@@ -246,6 +252,8 @@ void LoadSettings() {
     if (g_Settings.bgOpacity < 0) g_Settings.bgOpacity = 0;
     if (g_Settings.bgOpacity > 255) g_Settings.bgOpacity = 255;
 
+    g_Settings.adaptiveColor = Wh_GetIntSetting(L"AdaptiveColor") != 0;  // new
+
     if (g_Settings.width < 100) g_Settings.width = 300;
     if (g_Settings.height < 24) g_Settings.height = 48;
 }
@@ -263,6 +271,19 @@ Bitmap* StreamToBitmap(IRandomAccessStreamWithContentType const& stream) {
         delete bmp;
     }
     return nullptr;
+}
+
+// --- Helper to extract dominant colour from album art ---
+Color ExtractDominantColor(Bitmap* bmp) {
+    if (!bmp) return Color(0xFF, 0, 0, 0); // black
+    // Create a 1x1 bitmap and draw the whole image into it (average colour)
+    Bitmap tiny(1, 1, PixelFormat32bppARGB);
+    Graphics g(&tiny);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.DrawImage(bmp, Rect(0, 0, 1, 1), 0, 0, bmp->GetWidth(), bmp->GetHeight(), UnitPixel);
+    Color color;
+    tiny.GetPixel(0, 0, &color);
+    return color;
 }
 
 void UpdateMediaInfo() {
@@ -309,6 +330,15 @@ void UpdateMediaInfo() {
             g_MediaState.artist = props.Artist().c_str();
             g_MediaState.isPlaying = (info.PlaybackStatus() == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
             g_MediaState.hasMedia = true;
+
+            // Extract dominant colour if adaptive mode is on
+            if (g_Settings.adaptiveColor && g_MediaState.albumArt) {
+                Color dom = ExtractDominantColor(g_MediaState.albumArt);
+                g_DominantColor = dom.GetValue();
+                // Post message to update window appearance
+                if (g_hMediaWindow)
+                    PostMessage(g_hMediaWindow, WM_APP + 11, 0, 0);
+            }
 
             INT64 pos = timeline.Position().count();
             if (pos < 0) pos = 0;
@@ -454,6 +484,13 @@ DWORD GetCurrentTextColor() {
 }
 
 void UpdateAppearance(HWND hwnd) {
+    // Remove any border by setting DWM border colour to transparent
+    DWORD borderColor = 0x00000000; // transparent
+    DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borderColor, sizeof(borderColor));
+    // Ensure immersive dark mode to avoid light borders in light theme
+    BOOL useDarkMode = TRUE;
+    DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &useDarkMode, sizeof(useDarkMode));
+
     DWM_WINDOW_CORNER_PREFERENCE preference = DWMWCP_ROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference, sizeof(preference));
 
@@ -462,7 +499,14 @@ void UpdateAppearance(HWND hwnd) {
         auto SetComp = (pSetWindowCompositionAttribute)GetProcAddress(hUser, "SetWindowCompositionAttribute");
         if (SetComp) {
             DWORD tint = 0; 
-            if (g_Settings.autoTheme) {
+            if (g_Settings.adaptiveColor) {
+                // Use the dominant colour with fixed opacity (40% = 0x40)
+                BYTE a = 0x40;
+                BYTE r = (g_DominantColor >> 16) & 0xFF;
+                BYTE g = (g_DominantColor >> 8) & 0xFF;
+                BYTE b = g_DominantColor & 0xFF;
+                tint = (a << 24) | (r << 16) | (g << 8) | b;
+            } else if (g_Settings.autoTheme) {
                 tint = IsSystemLightMode() ? 0x40FFFFFF : 0x40000000;
             } else {
                 tint = (g_Settings.bgOpacity << 24) | (0xFFFFFF); 
@@ -612,7 +656,12 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
         SolidBrush barBg(Color(80, mainColor.GetRed(), mainColor.GetGreen(), mainColor.GetBlue()));
         graphics.FillRectangle(&barBg, 0, barY, width, barHeight);
 
-        SolidBrush barFill(mainColor);
+        // Fill with dominant colour if adaptive, else the main text colour
+        Color barFillColor = mainColor;
+        if (g_Settings.adaptiveColor) {
+            barFillColor = Color(g_DominantColor);
+        }
+        SolidBrush barFill(barFillColor);
         graphics.FillRectangle(&barFill, 0, barY, (int)(width * fraction), barHeight);
     }
 }
@@ -717,6 +766,11 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             InvalidateRect(hwnd, NULL, TRUE);
             return 0;
 
+        case WM_APP + 11:  // new – adaptive colour update
+            UpdateAppearance(hwnd);
+            InvalidateRect(hwnd, NULL, TRUE);
+            return 0;
+
         case WM_TIMER:
             if (wParam == IDT_POLL_MEDIA) {
                 UpdateMediaInfo();
@@ -796,7 +850,7 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
             bool taskbarVisible = IsTaskbarEffectivelyVisible(hTaskbar);
 
-            // --- Immediate show when taskbar becomes visible (auto-hide) ---
+            // Immediate show for auto‑hide taskbar reveal
             if (taskbarVisible && !IsWindowVisible(hwnd) && !g_IsHiddenByIdle) {
                 bool gameModeHide = false;
                 if (g_Settings.hideFullscreen) {
@@ -809,7 +863,6 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (!gameModeHide) {
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 }
-                // Reposition immediately
                 RECT rcTaskbar;
                 GetWindowRect(hTaskbar, &rcTaskbar);
                 int x = rcTaskbar.left + g_Settings.offsetX;
@@ -822,7 +875,7 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 return 0;
             }
 
-            // --- Regular debounce for repositioning / hiding ---
+            // Debounce for repositioning/hiding
             if (!EqualRect(&rc, &s_lastTaskbarRect)) {
                 s_lastTaskbarRect = rc;
                 SetTimer(hwnd, IDT_DEBOUNCE, 500, NULL);
@@ -1008,6 +1061,7 @@ void WhTool_ModSettingsChanged() {
          PostMessage(g_hMediaWindow, WM_TIMER, IDT_POLL_MEDIA, 0);
          PostMessage(g_hMediaWindow, WM_SETTINGCHANGE, 0, 0);
          PostMessage(g_hMediaWindow, WM_APP + 10, 0, 0);
+         PostMessage(g_hMediaWindow, WM_APP + 11, 0, 0); // refresh adaptive colour
     }
 }
 
