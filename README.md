@@ -2,13 +2,13 @@
 
 A media controller that uses Windows 11 native DWM styling for a seamless look.
 
-### 🛠️ Fork Changelog (v4.2.5)
-* **Fixed:** Instant widget appearance when taskbar auto-hide reveals (bypasses debounce).
-* **Fixed:** App opening fallback now uses case‑insensitive substring matching (fixes Edge, Spotify, etc.).
-* **Fixed:** Progress bar now spans the full width of the panel.
-* **Fixed:** Duration now uses MaxSeekTime as fallback.
-* **Fixed:** Startup flashing when the taskbar is auto-hidden.
-* **Fixed:** Added 500 ms debounce only for startup / taskbar size changes.
+### 🛠️ Fork Changelog (v4.3.1)
+* **Fixed:** Memory leak / constant-calling when taskbar auto-hides at rest.
+* **Fixed:** Widget no longer leaves a visible "lip" when the taskbar auto-hides.
+* **Fixed:** Resolved visibility loop bugs causing flickering.
+* **Fixed:** Added DPI scaling support for hidden taskbars (4K monitor fix).
+* **Added:** Adaptive Color — tint the panel background from album art.
+* **Fixed:** Removed unused <vector> and <atomic> headers.
 * *Modifications by Chaython.*
 
 ## 🚀 v3 vs v4: Major Architecture Shift
