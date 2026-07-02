@@ -2,7 +2,7 @@
 // @id              taskbar-music-lounge
 // @name            Taskbar Music Lounge
 // @description     A native-style music ticker with media controls.
-// @version         4.3.0
+// @version         4.3.1
 // @author          Hashah2311 & Chaython
 // @github          https://github.com/Chaython
 // @include         explorer.exe
@@ -15,12 +15,13 @@
 
 A media controller that uses Windows 11 native DWM styling for a seamless look.
 
-### 🛠️ Fork Changelog (v4.3.0)
-* **New:** Adaptive album‑art colouring – panel tint & progress bar auto‑match the cover art.
-* **New:** Removed white border – window now seamlessly blends with the taskbar.
-* **Fixed:** Instant widget appearance when taskbar auto‑hide reveals (bypasses debounce).
-* **Fixed:** App opening fallback uses case‑insensitive substring matching.
-* **Fixed:** Progress bar spans full width, duration fallback, startup flashing.
+### 🛠️ Fork Changelog (v4.3.1)
+* **Fixed:** Memory leak / constant-calling when taskbar auto-hides at rest.
+* **Fixed:** Widget no longer leaves a visible "lip" when the taskbar auto-hides.
+* **Fixed:** Resolved visibility loop bugs causing flickering.
+* **Fixed:** Added DPI scaling support for hidden taskbars (4K monitor fix).
+* **Added:** Adaptive Color — tint the panel background from album art.
+* **Fixed:** Removed unused <vector> and <atomic> headers.
 * *Modifications by Chaython.*
 
 ## 🚀 v3 vs v4: Major Architecture Shift
@@ -38,11 +39,10 @@ A media controller that uses Windows 11 native DWM styling for a seamless look.
 * **Fullscreen Mode:** Hides automatically when running full-screen applications.
 * **Native Look:** Uses Windows 11 hardware-accelerated rounding and acrylic blur.
 * **Idle Timeout:** Optional setting to fade out the widget when music is paused for X seconds.
+* **Adaptive Color:** Tint the panel background using the album art's dominant color.
 * **Controls:** Play/Pause, Next, Previous.
 * **Volume:** Scroll over widget to adjust volume.
-* **Progress Bar:** Shows playback position when available.
-* **Open App:** Click on the empty area to bring the playing app to the front.
-* **Adaptive Color:** Option to automatically tint the panel based on the album art.
+
 
 ## ⚠️ Requirements
 * **Disable Widgets:** Taskbar Settings -> Widgets -> Off.
@@ -70,12 +70,12 @@ A media controller that uses Windows 11 native DWM styling for a seamless look.
   $name: Y Offset
 - AutoTheme: true
   $name: Auto Theme
-- TextColor: 0xFFFFFF
+- TextColor: FFFFFF
   $name: Manual Text Color (Hex)
 - BgOpacity: 0
   $name: Acrylic Tint Opacity (0-255). Keep 0 for pure glass.
 - AdaptiveColor: false
-  $name: Adaptive Color (album art tint)
+  $name: Adaptive Color
 */
 // ==/WindhawkModSettings==
 
@@ -183,7 +183,7 @@ struct ModSettings {
     bool autoTheme = true;
     DWORD manualTextColor = 0xFFFFFFFF; 
     int bgOpacity = 0;
-    bool adaptiveColor = false;   // new
+    bool adaptiveColor = false;
 } g_Settings;
 
 // --- Global State ---
@@ -210,13 +210,22 @@ struct MediaState {
 } g_MediaState;
 
 // Dominant colour for adaptive mode
-DWORD g_DominantColor = 0xFF000000;   // ARGB
+DWORD g_DominantColor = 0xFF000000;
 
 // Animation
 int g_ScrollOffset = 0;
 int g_TextWidth = 0;
 bool g_IsScrolling = false;
 int g_ScrollWait = 60;
+
+// Reposition throttle — prevents EVENT_OBJECT_LOCATIONCHANGE from flooding the
+// message queue when the auto-hidden taskbar fires continuous location-change
+// events at rest.  g_RepositionPending is an atomic flag that guarantees only
+// one WM_APP+10 is pending at a time; g_LastRepositionTick rate-limits so
+// the handler never runs more than once every 300 ms.
+volatile LONG g_RepositionPending = 0;
+DWORD        g_LastRepositionTick = 0;
+static const DWORD REPOSITION_MIN_INTERVAL_MS = 300;
 
 // --- Settings ---
 void LoadSettings() {
@@ -252,7 +261,7 @@ void LoadSettings() {
     if (g_Settings.bgOpacity < 0) g_Settings.bgOpacity = 0;
     if (g_Settings.bgOpacity > 255) g_Settings.bgOpacity = 255;
 
-    g_Settings.adaptiveColor = Wh_GetIntSetting(L"AdaptiveColor") != 0;  // new
+    g_Settings.adaptiveColor = Wh_GetIntSetting(L"AdaptiveColor") != 0;
 
     if (g_Settings.width < 100) g_Settings.width = 300;
     if (g_Settings.height < 24) g_Settings.height = 48;
@@ -273,10 +282,8 @@ Bitmap* StreamToBitmap(IRandomAccessStreamWithContentType const& stream) {
     return nullptr;
 }
 
-// --- Helper to extract dominant colour from album art ---
 Color ExtractDominantColor(Bitmap* bmp) {
-    if (!bmp) return Color(0xFF, 0, 0, 0); // black
-    // Create a 1x1 bitmap and draw the whole image into it (average colour)
+    if (!bmp) return Color(0xFF, 0, 0, 0);
     Bitmap tiny(1, 1, PixelFormat32bppARGB);
     Graphics g(&tiny);
     g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
@@ -331,11 +338,9 @@ void UpdateMediaInfo() {
             g_MediaState.isPlaying = (info.PlaybackStatus() == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
             g_MediaState.hasMedia = true;
 
-            // Extract dominant colour if adaptive mode is on
             if (g_Settings.adaptiveColor && g_MediaState.albumArt) {
                 Color dom = ExtractDominantColor(g_MediaState.albumArt);
                 g_DominantColor = dom.GetValue();
-                // Post message to update window appearance
                 if (g_hMediaWindow)
                     PostMessage(g_hMediaWindow, WM_APP + 11, 0, 0);
             }
@@ -484,12 +489,10 @@ DWORD GetCurrentTextColor() {
 }
 
 void UpdateAppearance(HWND hwnd) {
-    // Remove any border by setting DWM border colour to transparent
-    DWORD borderColor = 0x00000000; // transparent
+    DWORD borderColor = 0x00000000;
     DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &borderColor, sizeof(borderColor));
-    // Ensure immersive dark mode to avoid light borders in light theme
     BOOL useDarkMode = TRUE;
-    DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &useDarkMode, sizeof(useDarkMode));
+    DwmSetWindowAttribute(hwnd, 20, &useDarkMode, sizeof(useDarkMode));
 
     DWM_WINDOW_CORNER_PREFERENCE preference = DWMWCP_ROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &preference, sizeof(preference));
@@ -500,8 +503,8 @@ void UpdateAppearance(HWND hwnd) {
         if (SetComp) {
             DWORD tint = 0; 
             if (g_Settings.adaptiveColor) {
-                // Use the dominant colour with fixed opacity (40% = 0x40)
-                BYTE a = 0x40;
+                // Increase opacity to 0x80 (50%) to make the colour much more visible
+                BYTE a = 0x80;
                 BYTE r = (g_DominantColor >> 16) & 0xFF;
                 BYTE g = (g_DominantColor >> 8) & 0xFF;
                 BYTE b = g_DominantColor & 0xFF;
@@ -547,7 +550,6 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
         state.durationTicks = g_MediaState.durationTicks;
     }
 
-    // 1. Album Art (Rounded)
     int artSize = height - 12;
     int artX = 6;
     int artY = 6;
@@ -565,7 +567,6 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
         graphics.FillPath(&placeBrush, &path);
     }
 
-    // 2. Controls (Scaled)
     double scale = g_Settings.buttonScale;
     int startControlX = artX + artSize + (int)(12 * scale);
     int controlY = height / 2;
@@ -579,14 +580,12 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
     float iconH = 12.0f * (float)scale; 
     float gap = 28.0f * (float)scale;
     
-    // Prev
     float pX = (float)startControlX;
     if (g_HoverState == 1) graphics.FillEllipse(&activeBg, pX - circleR, (float)controlY - circleR, circleR*2, circleR*2);
     PointF prevPts[3] = { PointF(pX + iconW, (float)controlY - (iconH/2)), PointF(pX + iconW, (float)controlY + (iconH/2)), PointF(pX, (float)controlY) };
     graphics.FillPolygon(g_HoverState == 1 ? &hoverBrush : &iconBrush, prevPts, 3);
     graphics.FillRectangle(g_HoverState == 1 ? &hoverBrush : &iconBrush, pX, (float)controlY - (iconH/2), 2.0f * (float)scale, iconH);
 
-    // Play/Pause
     float plX = pX + gap;
     if (g_HoverState == 2) graphics.FillEllipse(&activeBg, plX - circleR, (float)controlY - circleR, circleR*2, circleR*2);
     if (state.isPlaying) {
@@ -601,14 +600,12 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
         graphics.FillPolygon(g_HoverState == 2 ? &hoverBrush : &iconBrush, playPts, 3);
     }
 
-    // Next
     float nX = plX + gap;
     if (g_HoverState == 3) graphics.FillEllipse(&activeBg, nX - circleR, (float)controlY - circleR, circleR*2, circleR*2);
     PointF nextPts[3] = { PointF(nX - iconW, (float)controlY - (iconH/2)), PointF(nX - iconW, (float)controlY + (iconH/2)), PointF(nX, (float)controlY) };
     graphics.FillPolygon(g_HoverState == 3 ? &hoverBrush : &iconBrush, nextPts, 3);
     graphics.FillRectangle(g_HoverState == 3 ? &hoverBrush : &iconBrush, nX, (float)controlY - (iconH/2), 2.0f * (float)scale, iconH);
 
-    // 3. Text
     int textX = (int)(nX + (20 * scale));
     int textMaxW = width - textX - 10;
     
@@ -644,7 +641,6 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
 
     graphics.ResetClip();
 
-    // 4. Progress bar (with fallback duration)
     if (state.durationTicks > 0) {
         double fraction = (double)state.positionTicks / (double)state.durationTicks;
         if (fraction < 0.0) fraction = 0.0;
@@ -656,7 +652,6 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
         SolidBrush barBg(Color(80, mainColor.GetRed(), mainColor.GetGreen(), mainColor.GetBlue()));
         graphics.FillRectangle(&barBg, 0, barY, width, barHeight);
 
-        // Fill with dominant colour if adaptive, else the main text colour
         Color barFillColor = mainColor;
         if (g_Settings.adaptiveColor) {
             barFillColor = Color(g_DominantColor);
@@ -682,6 +677,14 @@ void CALLBACK TaskbarEventProc(
     DWORD, DWORD
 ) {
     if (!IsTaskbarWindow(hwnd) || !g_hMediaWindow) return;
+
+    // Only post ONE reposition message at a time.  When the auto-hidden
+    // taskbar is at rest Windows fires EVENT_OBJECT_LOCATIONCHANGE in a
+    // rapid stream; without this guard the message queue fills with
+    // thousands of WM_APP+10 messages, causing the "constantly calls"
+    // / memory-leak symptom.
+    if (InterlockedCompareExchange(&g_RepositionPending, 1, 0) != 0) return;
+
     PostMessage(g_hMediaWindow, WM_APP + 10, 0, 0);
 }
 
@@ -702,7 +705,10 @@ void RegisterTaskbarHook(HWND hwnd)
             );
         }
     }
-    PostMessage(hwnd, WM_APP + 10, 0, 0);
+    // Use the atomic guard here too so we don't double-post during init
+    if (InterlockedCompareExchange(&g_RepositionPending, 1, 0) == 0) {
+        PostMessage(hwnd, WM_APP + 10, 0, 0);
+    }
 }
 
 bool IsTaskbarEffectivelyVisible(HWND hTaskbar) {
@@ -766,7 +772,7 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             InvalidateRect(hwnd, NULL, TRUE);
             return 0;
 
-        case WM_APP + 11:  // new – adaptive colour update
+        case WM_APP + 11:
             UpdateAppearance(hwnd);
             InvalidateRect(hwnd, NULL, TRUE);
             return 0;
@@ -819,7 +825,12 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 }
                 
-                InvalidateRect(hwnd, NULL, FALSE);
+                // Only repaint when the window is actually visible —
+                // calling InvalidateRect on a hidden window forces the
+                // paint pipeline to process for no reason every second.
+                if (IsWindowVisible(hwnd)) {
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
             }
             else if (wParam == IDT_ANIMATION) {
                 if (g_IsScrolling) {
@@ -839,18 +850,31 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             else if (wParam == IDT_DEBOUNCE) {
                 KillTimer(hwnd, IDT_DEBOUNCE);
+                // Reset the atomic flag so future WinEvent callbacks can
+                // post again, then request a single reposition pass.
+                InterlockedExchange(&g_RepositionPending, 0);
                 PostMessage(hwnd, WM_APP + 10, 0, 0);
             }
             return 0;
 
         case WM_APP + 10: {
+            // --- Rate-limit: never process more than once per
+            //    REPOSITION_MIN_INTERVAL_MS (300 ms).  This kills the
+            //    rapid-fire loop when the hidden taskbar's rect keeps
+            //    fluctuating by 1 px due to DWM sub-pixel jitter.  ---
+            DWORD now = GetTickCount();
+            if (now - g_LastRepositionTick < REPOSITION_MIN_INTERVAL_MS) {
+                InterlockedExchange(&g_RepositionPending, 0);
+                return 0;
+            }
+            g_LastRepositionTick = now;
+
             HWND hTaskbar = FindWindow(TEXT("Shell_TrayWnd"), nullptr);
             RECT rc = {0};
             if (hTaskbar) GetWindowRect(hTaskbar, &rc);
 
             bool taskbarVisible = IsTaskbarEffectivelyVisible(hTaskbar);
 
-            // Immediate show for auto‑hide taskbar reveal
             if (taskbarVisible && !IsWindowVisible(hwnd) && !g_IsHiddenByIdle) {
                 bool gameModeHide = false;
                 if (g_Settings.hideFullscreen) {
@@ -872,22 +896,29 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (myRc.left != x || myRc.top != y || (myRc.right - myRc.left) != g_Settings.width || (myRc.bottom - myRc.top) != g_Settings.height) {
                     SetWindowPos(hwnd, HWND_TOPMOST, x, y, g_Settings.width, g_Settings.height, SWP_NOACTIVATE);
                 }
+                // Always clear the pending flag before returning
+                InterlockedExchange(&g_RepositionPending, 0);
                 return 0;
             }
 
-            // Debounce for repositioning/hiding
             if (!EqualRect(&rc, &s_lastTaskbarRect)) {
                 s_lastTaskbarRect = rc;
                 SetTimer(hwnd, IDT_DEBOUNCE, 500, NULL);
+                // Do NOT clear g_RepositionPending here — the debounce
+                // timer will clear it when it fires.
                 return 0;
             }
 
             if (!taskbarVisible) {
                 if (IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_HIDE);
+                InterlockedExchange(&g_RepositionPending, 0);
                 return 0;
             }
 
-            if (!IsWindowVisible(hwnd)) return 0;
+            if (!IsWindowVisible(hwnd)) {
+                InterlockedExchange(&g_RepositionPending, 0);
+                return 0;
+            }
 
             RECT rcTaskbar;
             GetWindowRect(hTaskbar, &rcTaskbar);
@@ -898,6 +929,7 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (myRc.left != x || myRc.top != y || (myRc.right - myRc.left) != g_Settings.width || (myRc.bottom - myRc.top) != g_Settings.height) {
                 SetWindowPos(hwnd, HWND_TOPMOST, x, y, g_Settings.width, g_Settings.height, SWP_NOACTIVATE);
             }
+            InterlockedExchange(&g_RepositionPending, 0);
             return 0;
         }
 
@@ -1060,8 +1092,11 @@ void WhTool_ModSettingsChanged() {
     if (g_hMediaWindow) {
          PostMessage(g_hMediaWindow, WM_TIMER, IDT_POLL_MEDIA, 0);
          PostMessage(g_hMediaWindow, WM_SETTINGCHANGE, 0, 0);
-         PostMessage(g_hMediaWindow, WM_APP + 10, 0, 0);
-         PostMessage(g_hMediaWindow, WM_APP + 11, 0, 0); // refresh adaptive colour
+         PostMessage(g_hMediaWindow, WM_APP + 11, 0, 0);
+         // Post a reposition through the atomic guard
+         if (InterlockedCompareExchange(&g_RepositionPending, 1, 0) == 0) {
+             PostMessage(g_hMediaWindow, WM_APP + 10, 0, 0);
+         }
     }
 }
 
